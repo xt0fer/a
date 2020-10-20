@@ -1,22 +1,26 @@
 package main
 
 import (
-	"fmt"
 	"image"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 
-	"github.com/as/edit"
 	"github.com/as/event"
-	"github.com/as/path"
+	"github.com/as/srv/fs"
 	"github.com/as/text"
 	"github.com/as/text/action"
 	"github.com/as/text/find"
+	"github.com/as/ui/col"
 	"github.com/as/ui/tag"
-	"github.com/as/ui/win"
 )
+
+type Named interface {
+	Plane
+	FileName() string
+}
+type Indexer interface {
+	Lookup(interface{}) Plane
+}
 
 func AbsOf(basedir, path string) string {
 	if filepath.IsAbs(path) {
@@ -25,192 +29,195 @@ func AbsOf(basedir, path string) string {
 	return filepath.Join(basedir, path)
 }
 
-// Looks are done in the following order
-// 1). Tag name - if it exists already jump to the tag, if there's an address jump
-//	to that address in the tag
-//
-// 2). Readable absolute file - if the name matches a readable file in the namespaces
-//	file system
-//
-// 3). Readable relative file - if the name matches the name of a readable file in
-//	the tags base directory
-//
-// Address lookups follow for each of the three above
-//
-// 4). An address in the destination
+var resolver = &fs.Resolver{
+	Fs: newfsclient(),
+}
+
+type vis struct {
+}
+
+func (v *vis) Look(e event.Look) {
+}
+
+func (g *Grid) cwd() string {
+	s, _ := os.Getwd()
+	return s
+}
+
+// hiclick returns true if the nil address (q0,q1) intersects
+// the highlighted selection (r0:r1)
+func hiclick(r0, r1, q0, q1 int64) bool {
+	x := r0 == r1 && text.Region3(r0, q0-1, q1) == 0
+	return x
+}
 
 func (g *Grid) Look(e event.Look) {
-	name, addr := action.SplitPath(string(e.P))
-	if g.meta(e.To[0]) {
+	if g.meta(g.Tag) {
 		return
 	}
+
+	ed := e.To[0]
+	t, _ := ed.(*tag.Tag)
+
+	p0, p1 := e.From.Dot() // pre-sweep
+	// e.Q0 and e.Q1 is post sweep
+
+	if e.Q0 == e.Q1 && !hiclick(e.Q0, e.Q1, p0, p1) {
+		// one click outside old selection
+		// expand the address
+		a1 := expandFile(d2a(e.Q0, e.Q1), e.From)
+		e.Q0, e.Q1 = a1.Dot()
+	} else if e.Q0 == e.Q1 {
+		// click inside old selection
+		// use the old selection
+		e.Q0, e.Q1 = p0, p1
+	} else {
+		// selection overlaps old selection
+		// we don't care about that
+	}
+
+	//fmt.Printf("name and dot %q %d %d\n", e.P, e.Q0, e.Q1)
+	e.P = e.P[e.Q0:e.Q1] //ed.Bytes()
+
+	name, addr := action.SplitPath(string(e.P))
 	if name == "" && addr == "" {
 		return
 	}
+
+	if matches(httpLink.Plumb(&Plumbmsg{Data: e.P})) {
+		return
+	}
 	if name == "" {
-		prog, err := edit.Compile(addr)
-		if err != nil {
-			g.aerr(err.Error())
+		if t == nil {
 			return
 		}
-		t := e.To[0]
-		prog.Run(t)
-		ajump(t, cursorNop)
+		if t.Window == nil {
+			return
+		}
+		if g.EditRun(addr, t.Window) {
+			ajump(ed, cursorNop)
+		}
 		return
 	}
 
-	// Existing window label?
 	if label := g.Lookup(name); label != nil {
-		fn := moveMouse
-		if name == "" {
-			fn = cursorNop
-		}
-		//TODO(as): danger, edit needs a way to ensure it will only jump to an address
-		// we can expose an address parsing function from edit
-		prog, err := edit.Compile(addr)
-		if err != nil {
-			g.aerr(err.Error())
+		// TODO(as): This fails to find labels like +Error
+		// and is overall useless
+		t, _ := label.(*tag.Tag)
+		if t == nil {
+			logf("nil tag")
 			return
 		}
-		if t := label.(*tag.Tag); t.Body != nil {
-			prog.Run(t.Body)
-			ajump(t.Body, fn)
+		if t.Window == nil || !g.EditRun(addr, t.Window) {
+			ajump(t, cursorNop)
+			return
+		} else if t.Window != nil {
+			ajump(t.Window, moveMouse)
+			return
 		}
+		ajump(t, moveMouse)
 		return
 	}
 
-	abspath := ""
-	visible := ""
 	exists := false
-	switch {
-	case filepath.IsAbs(name):
-		if !path.Exists(name) {
-			break
-		}
-		abspath = filepath.Clean(name)
-		visible = abspath
-	case filepath.IsAbs(e.Name):
-		if !path.Exists(e.Name) {
-			// The tag might point to a non-existent file but its parent directory
-			// might be valid. In this case we should look inside the directory
-			// even though the file doesn't exist. This makes +Error windows work
-			// as intended
-			e.Name = filepath.Dir(e.Name)
-		}
-		if !path.Exists(e.Name) {
-			break
-		}
-		abspath = filepath.Join(path.DirOf(e.Name), name)
-		visible = abspath
-	case filepath.IsAbs(e.Basedir):
-		if !path.Exists(e.Basedir) {
-			break
-		}
-		abspath = path.DirOf(e.Basedir)
-		visible = filepath.Join(path.DirOf(e.Name), name)
-	default:
-	}
+	info, existsRemote := resolver.Look(fs.Path{Root: g.cwd(), Tag: e.Name, Pred: name})
 
-	stat := func(name string) os.FileInfo {
-		fi, _ := os.Stat(name)
-		return fi
-	}
-	VisitAll(g, func(p Named) {
-		if abspath == p.FileName() {
-			exists = true
-		} else if os.SameFile(stat(abspath), stat(p.FileName())) {
-			exists = true
-		}
-	})
-
-	var t *tag.Tag
-	if exists {
-		q := g.Lookup(abspath)
-		if q, ok := q.(*tag.Tag); ok {
-			t = q
-		}
-	} else if abspath == visible && path.Exists(visible) {
-		t = New(actCol, path.DirOf(abspath), visible).(*tag.Tag)
-	} else if realpath := filepath.Join(abspath, visible); path.Exists(realpath) {
-		t = New(actCol, path.DirOf(abspath), visible).(*tag.Tag)
+	t, exists = g.Lookup(info.Path).(*tag.Tag)
+	if !exists && existsRemote {
+		t, _ = New(actCol, info.Dir, info.Path).(*tag.Tag)
+		getcmd(t)
 	}
 	if t != nil {
-		if addr != "" {
-			//TODO(as): danger, edit needs a way to ensure it will only jump to an address
-			edit.MustCompile(addr).Run(t.Body)
-			ajump(t.Body, moveMouse)
+		if g.EditRun(addr, t.Window) {
+			ajump(t.Window, moveMouse)
 		} else {
 			ajump(t, moveMouse)
 		}
 		return
 	}
 
+	if !exists && !existsRemote {
+		advance, _ := g.guru(e.Name, e.Q0, e.Q1)
+		if !advance {
+			return
+		}
+	}
+
 	//TODO(as): fix this so it doesn't compare hard coded coordinates
-	if e.To[0].(*win.Win) == nil || e.To[0].(Plane).Loc().Max.Y < 48 {
+	if e.To[0] == nil {
 		VisitAll(g, func(p Named) {
 			if p == nil {
 				return
 			}
-			lookliteral(p.(*tag.Tag).Body, e.P, cursorNop)
+			lookliteral(p.(*tag.Tag).Window, e, cursorNop)
 		})
 	} else {
-		lookliteral(e.To[0], e.P, moveMouse)
-	}
 
-}
-func (g *Grid) afinderr(wd string, name string) *tag.Tag {
-	if !strings.HasSuffix(name, "+Errors") {
-		name += "+Errors"
-	}
-	t := g.FindName(name)
-	if t == nil {
-		c := g.List[len(g.List)-1].(*Col)
-		t = New(c, "", name, SizeThirdOf).(*tag.Tag)
-		if t == nil {
-			panic("cant create tag")
+		if e.To[0] != e.From {
+			lookliteraltag(e.To[0], e.Q0, e.Q1, e.P)
+		} else {
+			lookliteral(e.To[0], e, moveMouse)
 		}
-		moveMouse(t.Loc().Min)
 	}
-	return t
 }
-func (g *Grid) aerr(fm string, i ...interface{}) {
-	t := g.afinderr(".", "")
-	q1 := t.Body.Len()
-	t.Body.Select(q1, q1)
-	n := int64(t.Body.Insert([]byte(time.Now().Format(timefmt)+": "+fmt.Sprintf(fm, i...)+"\n"), q1))
-	t.Body.Select(q1, q1+n)
-	t.Body.Jump(cursorNop)
+
+func stub(g *Grid, p Plane) bool {
+	if p == nil {
+		return false
+	}
+	if p == g.Tag {
+		return true
+	}
+	l := g.Kids()
+	for i := range l {
+		c, _ := l[i].(*col.Col)
+		if c != nil && p == c.Tag {
+			return true
+		}
+	}
+	return false
 }
-func (g *Grid) aout(fm string, i ...interface{}) {
-	t := g.afinderr(".", "")
-	q1 := t.Body.Len()
-	t.Body.Select(q1, q1)
-	n := int64(t.Body.Insert([]byte(fmt.Sprintf(fm, i...)+"\n"), q1))
-	t.Body.Select(q1, q1+n)
-	t.Body.Jump(cursorNop)
+
+func lookliteraltag(ed text.Editor, q0, q1 int64, what []byte) {
+	q0, q1 = ed.Dot()
+	s0, s1 := find.FindNext(ed, q0, q1, what)
+	ed.Select(s0, s1)
+	ajump(ed, cursorNop)
 }
-func lookliteral(ed text.Editor, p []byte, mouseFunc func(image.Point)) {
-	// String literal
-	q0, q1 := find.FindNext(ed, p)
+
+func lookliteral(ed text.Editor, e event.Look, mouseFunc func(image.Point)) {
+	// The behavior of look:
+	//
+	// Independent of the dot range, mark the given range as the starting point.
+	// Advance to the end of the starting point
+	// Search for the value repsesenting the range under the original starting point.
+	// If the found range is identical to the starting point, no result has been found
+
+	t0, t1 := ed.Dot()
+
+	q0, q1 := find.FindNext(ed, e.Q1, e.Q1, e.P)
+	//fmt.Printf("after q0,q1: %d,%d\n\n\t%q\n", e.Q0, e.Q1, e.P)
+
+	if q0 == e.Q0 && q1 == e.Q1 {
+		ed.Select(t0, t1)
+		return
+	}
 	ed.Select(q0, q1)
 	ajump(ed, mouseFunc)
 }
 
 func (g *Grid) meta(p interface{}) bool {
-	if w, ok := p.(*win.Win); ok {
-		return w == g.List[0].(*tag.Tag).Win
-	}
-	return false
+	return p == g.Tag.Label
 }
 
 func VisitAll(root Plane, fn func(p Named)) {
+	type List interface {
+		Kids() []Plane
+	}
+
 	switch root := root.(type) {
-	case *Grid:
-		for _, k := range root.List[1:] {
-			VisitAll(k, fn)
-		}
-	case *Col:
-		for _, k := range root.List[1:] {
+	case List:
+		for _, k := range root.Kids() {
 			VisitAll(k, fn)
 		}
 	case Named:
@@ -221,16 +228,22 @@ func VisitAll(root Plane, fn func(p Named)) {
 	}
 }
 
-func (col *Col) Kids() []Plane {
-	return col.List
+func (g *Grid) FindName(name string) *tag.Tag {
+	for _, p := range g.List {
+		c, _ := p.(*Col)
+		if c == nil {
+			continue
+		}
+		t := c.FindName(name)
+		if t != nil {
+			return t
+		}
+	}
+	return nil
 }
 
-func (col *Col) Dirty() bool {
-	return true
-}
-
-func (grid *Grid) Lookup(pid interface{}) Plane {
-	for _, k := range grid.Kids() {
+func (g *Grid) Lookup(pid interface{}) Plane {
+	for _, k := range g.Kids() {
 		if k, ok := k.(Indexer); ok {
 			tag := k.Lookup(pid)
 			if tag != nil {
@@ -241,79 +254,73 @@ func (grid *Grid) Lookup(pid interface{}) Plane {
 	return nil
 }
 
-func (col *Col) Lookup(pid interface{}) Plane {
-	kids := col.Kids()
-	if len(kids) == 0 {
+/*
+
+type Looker struct {
+	*tag.Tag // owning tag
+	*win.Win // source of the address below
+	Q0, Q1   int64
+	P        []byte
+	err      error
+}
+
+func (e *Looker) Err() error {
+	if e.err == nil {
+		if e.Win == nil {
+			e.err = ErrNoWin
+		}
+		if e.Tag == nil {
+			e.err = ErrNoTag
+		}
+	}
+	return e.err
+}
+
+func (l *Looker) FromTag() bool {
+	return l.Tag.Win == l.Win
+}
+
+func (e *Looker) SplitAddr() (name, addr string) {
+	e.Q0, e.Q1 = expand3(e.Win, e.Q0, e.Q1)
+	return action.SplitPath(string(e.Win.Bytes()[e.Q0:e.Q1]))
+}
+
+func (e *Looker) LookGrid(g *Grid) (error) {
+	panic("unfinished")
+	if e.Err() != nil {
+		return e.Err()
+	}
+
+	name, addr := e.SplitAddr()
+	if name == "" && addr == "" {
 		return nil
 	}
-	switch pid := pid.(type) {
-	case int:
-		if pid >= len(kids) {
-			pid = len(kids) - 1
-		}
-		return col.Kids()[pid]
-	case string:
-		for i, v := range col.Kids() {
-			if v, ok := v.(Named); ok {
-				if v.FileName() == pid {
-					return col.Kids()[i]
-				}
-			}
-		}
-	case image.Point:
-		return ptInAny(pid, col.Kids()...)
-	case interface{}:
-		panic("")
-	}
-	return nil
-}
 
-type Named interface {
-	Plane
-	FileName() string
-}
-type Indexer interface {
-	Lookup(interface{}) Plane
-}
-
-func ptInPlane(pt image.Point, p Plane) bool {
-	if p == nil {
-		return false
-	}
-	return pt.In(p.Loc())
-}
-
-func ptInAny(pt image.Point, list ...Plane) (x Plane) {
-	for i, w := range list {
-		if ptInPlane(pt, w) {
-			return list[i]
+	if name == "" {
+		if g.EditRun(addr, e.Tag.Window) {
+			ajump(e.Tag.Window, cursorNop)
 		}
+		return nil
 	}
-	return nil
-}
 
-func ajump(p interface{}, cursor func(image.Point)) {
-	switch p := p.(type) {
-	case *tag.Tag:
-		if p != nil {
-			cursor(p.Loc().Min)
+	// Existing window label?
+	if label := g.Lookup(name); label != nil  {
+		t, _ := label.(*tag.Tag)
+		if t == nil{
+			logf("look d: tag is nil")
+			return
 		}
-	case text.Jumper:
-		p.Jump(cursor)
-	case Plane:
-		if cursor == nil {
-			cursor = shouldCursor(p)
+		if g.EditRun(addr, t.Window) {
+			ajump(t.Window, moveMouse)
 		}
-		cursor(p.Loc().Min)
+		return
 	}
-}
 
-func cursorNop(p image.Point) {}
-func shouldCursor(p Plane) (fn func(image.Point)) {
-	switch p.(type) {
-	case Named:
-		return cursorNop
-	default:
-		return moveMouse
-	}
+	// A file on the filesystem
+	info, exists := resolver.look(pathinfo{tag: e.Name, name: name})
+	t, exists = g.Lookup(info.abspath).(*tag.Tag)
+
+
+	panic("unfinished")
 }
+*/
